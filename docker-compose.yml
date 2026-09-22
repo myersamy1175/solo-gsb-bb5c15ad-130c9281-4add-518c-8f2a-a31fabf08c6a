@@ -1,3 +1,13 @@
+# 化学反应计量平衡服务 —— Docker Compose 编排。
+#
+# 构建并后台启动（首次或代码更新后）：
+#   docker compose up --build -d
+# 查看日志 / 停止：
+#   docker compose logs -f
+#   docker compose down
+# 容器内服务监听 8000，映射到宿主机同端口；健康检查见下方 healthcheck。
+name: reaction-balancer
+
 services:
   stoich:
     build: .

@@ -11,7 +11,10 @@
    `1..max_coefficient` 的互质正整数配平方案；
 5. `/stoichiometry/batch` 在唯一配平之上，用 `Decimal` 精确计算反应进度、
    并列限量试剂、各反应物消耗/剩余与各生成物理论产量；
-6. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+6. `/stoichiometry/plan` 做反向投料规划：按一个或多个生成物的目标摩尔数，
+   取各目标量/配平系数的最大值得到满足全部目标的最小反应进度，给出各反应物
+   理论需求量、各目标产物达成量与超额量；
+7. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -49,6 +52,15 @@ curl -X POST http://localhost:8000/api/v1/stoichiometry/batch \
        "amounts":[{"species":"CH4","moles":"1"},{"species":"O2","moles":"3"}]}'
 ```
 
+反向投料规划——要求至少产出 4 mol NH₃，看需要多少 N₂ / H₂：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stoichiometry/plan \
+  -H 'Content-Type: application/json' \
+  -d '{"reactants":["N2","H2"],"products":["NH3"],
+       "targets":[{"species":"NH3","moles":"4"}]}'
+```
+
 ### 不用 Docker 的本地运行方式
 
 ```bash
@@ -61,7 +73,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 138 个测试
+pytest          # 175 个测试
 ```
 
 ---
@@ -74,6 +86,7 @@ pytest          # 138 个测试
 | POST | `/api/v1/balance/variants` | 枚举自由变量 ≤3 时所有互质正整数配平方案 |
 | POST | `/api/v1/analyze` | 逐元素差异说明：配平前（单位系数）与配平后两个视图 |
 | POST | `/api/v1/stoichiometry/batch` | 投料摩尔数批量计量：反应进度、并列限量试剂、消耗/剩余与理论产量 |
+| POST | `/api/v1/stoichiometry/plan` | 反向投料规划：按生成物目标摩尔数求最小反应进度、理论投料需求与达成/超额量 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
 
@@ -295,7 +308,86 @@ curl -X POST http://localhost:8000/api/v1/stoichiometry/batch \
 反应物 / 生成物书写顺序或使用等价化学式，得到相同的 `reaction_id` 与完全
 一致的计算结果（仅 `input` 字段回显原始写法）。
 
-### 2.5 幂等与查询
+### 2.5 反向投料规划 `POST /api/v1/stoichiometry/plan`
+
+与 `/stoichiometry/batch` 方向相反：客户端为**一个或多个生成物**提交目标
+摩尔数（允许只覆盖部分生成物），服务端以精确十进制（全程不经过 `float`）
+计算：
+
+* 满足全部目标所需的**最小反应进度** ξ = max(**目标量 ÷ 配平系数**)
+  （取最大值是为了让每个目标产物的达成量都不低于其目标量）；
+* 全部并列取得最大值的**驱动目标产物** `driving_targets`——目标比恰好
+  等于系数比时可多于一种；
+* 每种反应物的**理论需求量** `required = ξ·系数`；
+* 每个提交目标的产物：目标量 `target`、达成量 `achieved = ξ·系数`、
+  **超额量** `excess = achieved − target`（驱动产物为 `"0"`，其余为正）；
+* 全部生成物（含未提交目标的）在该进度下的达成量。
+
+请求体用 `targets` 代替 `amounts`；目标物种必须是规范化生成物之一
+（等价写法可识别），不能重复或出现未知物种，摩尔数同样必须是非负十进制
+字符串：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stoichiometry/plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reactants": ["NH3", "O2"],
+    "products": ["NO", "H2O"],
+    "targets": [
+      {"species": "NO",  "moles": "1"},
+      {"species": "H2O", "moles": "6"}
+    ]
+  }'
+```
+
+`4NH3 + 5O2 -> 4NO + 6H2O` 中两个目标比值分别为 1/4 与 6/6，ξ 取最大值
+`1`（由 `H2O` 驱动），因此 `NO` 实际达成 4 mol、超额 3 mol：
+
+```json
+{
+  "reaction_id": "rxn_……",
+  "cached": false,
+  "normalized": {
+    "reactants": ["NH3", "O2"],
+    "products": ["NO", "H2O"],
+    "equation": "4NH3 + 5O2 -> 4NO + 6H2O"
+  },
+  "reaction_extent": {"value": "1", "unit": "mol"},
+  "driving_targets": ["H2O"],
+  "reactants": [
+    {"input": "NH3", "normalized": "NH3", "coefficient": 4, "required": "4"},
+    {"input": "O2",  "normalized": "O2",  "coefficient": 5, "required": "5"}
+  ],
+  "targets": [
+    {"input": "NO", "normalized": "NO", "coefficient": 4,
+     "target": "1", "achieved": "4", "excess": "3", "is_driving": false},
+    {"input": "H2O", "normalized": "H2O", "coefficient": 6,
+     "target": "6", "achieved": "6", "excess": "0", "is_driving": true}
+  ],
+  "products": [
+    {"input": "NO", "normalized": "NO", "coefficient": 4, "achieved": "4"},
+    {"input": "H2O", "normalized": "H2O", "coefficient": 6, "achieved": "6"}
+  ]
+}
+```
+
+单目标示例：`3H2 + N2 -> 2NH3`，目标 `NH3 = 4` mol 时 ξ = 2，理论需求
+`H2 = 6` mol、`N2 = 2` mol，达成量恰为 4 mol、超额为 0。目标摩尔数为
+`"0"` 时 ξ 与所有理论需求均为 `"0"`。无限小数同样按 **28 位有效数字**
+银行家舍入输出（如目标 `CO2 = 1` mol 于 `Fe2O3 + 3CO -> 2Fe + 3CO2`
+时 ξ = 1/3 → `"0.3333333333333333333333333333"`）。
+
+错误结构与 `/stoichiometry/batch` 一致：
+
+| 场景 | HTTP / code |
+| --- | --- |
+| 反应式或目标物种无法解析 | `400 FORMULA_PARSE_ERROR` |
+| 反应式同侧物种重复 | `409 DUPLICATE_SPECIES` |
+| 目标重复或包含非生成物物种（详情 `details.duplicate/unknown`；允许只提交部分生成物） | `422 INVALID_REQUEST` |
+| 摩尔数非法：负数、`NaN`、`Infinity`、非数字字符串或 JSON 数字（详情 `details.invalid_moles`） | `422 INVALID_REQUEST` |
+| 反应无法唯一配平 / 无法配平 | `422 NON_UNIQUE_BALANCE` / `IMPOSSIBLE_BALANCE` 等 |
+
+### 2.6 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -367,7 +459,7 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | --- | --- | --- |
 | `FORMULA_PARSE_ERROR` | 400 | 化学式无法解析（未知元素、括号不匹配、电荷非法等） |
 | `DUPLICATE_SPECIES` | 409 | 同一侧出现重复物种 |
-| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字） |
+| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法 |
 | `IMPOSSIBLE_BALANCE` | 422 | 守恒方程组无解（含电荷无法守恒） |
 | `NON_UNIQUE_BALANCE` | 422 | 零空间维数 > 1，配平不唯一（返回 `nullity` 与自由度） |
 | `ZERO_COEFFICIENT` | 422 | 唯一解要求某些物种系数为 0 |
@@ -396,11 +488,11 @@ app/
   parser.py         递归下降化学式解析（元素/括号/电荷/电子）
   balancer.py       守恒矩阵、有理数 RREF、零空间、最小正整数、多变体枚举、守恒视图
   cache.py          规范化签名（SHA-256）与 LRU 幂等缓存
-  stoichiometry.py  投料量 -> 反应进度、并列限量试剂、消耗/剩余、理论产量（Decimal 精确计算）
+  stoichiometry.py  投料量 -> 反应进度（正向批量计量）与目标产量 -> 最小反应进度/理论投料（反向规划），Decimal 精确计算
   service.py        业务编排与响应组装
   models.py         Pydantic 请求/响应模型
   main.py           FastAPI 路由与异常处理
-tests/              解析器、配平核心、HTTP API、批量计量共 138 个测试
+tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划共 175 个测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

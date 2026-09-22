@@ -1,15 +1,24 @@
 """限量试剂与反应进度的精确计量计算。
 
-给定唯一配平后的反应（最小互质正整数系数）与每种反应物的投料摩尔数
-（:class:`decimal.Decimal`），计算：
+提供两个方向的计量：
 
-* 反应进度 ξ = min(投料量 ÷ 配平系数)，系数为正整数，结果为非负小数；
-* 所有并列取得最小值的限量试剂（可多于一种，如投料恰好按计量比）；
-* 每种反应物的消耗量（ξ·系数）与剩余量（投料量 − 消耗量）；
-* 每种生成物的理论产量（ξ·系数）。
+* 正向（投料 -> 进度）：:func:`compute_stoichiometry`
+  给定唯一配平后的反应（最小互质正整数系数）与每种反应物的投料摩尔数
+  （:class:`decimal.Decimal`），计算：
+  * 反应进度 ξ = min(投料量 ÷ 配平系数)，系数为正整数，结果为非负小数；
+  * 所有并列取得最小值的限量试剂（可多于一种，如投料恰好按计量比）；
+  * 每种反应物的消耗量（ξ·系数）与剩余量（投料量 − 消耗量）；
+  * 每种生成物的理论产量（ξ·系数）。
+
+* 反向（目标 -> 规划投料）：:func:`compute_reverse_plan`
+  给定一个或多个生成物的目标摩尔数，计算：
+  * 满足全部目标所需的最小反应进度 ξ = max(目标量 ÷ 配平系数)；
+  * 达成该进度所需的每种反应物理论需求量（ξ·系数）；
+  * 每种生成物在该进度下的实际达成量；目标产物同时给出目标量与
+    超额量（达成 − 目标，非目标产物超额量为 null）。
 
 为避免浮点误差，输入十进制先无损转成 :class:`fractions.Fraction`，
-比较与最小值判定全部使用精确有理数；最终结果再按
+比较与极值判定全部使用精确有理数；最终结果再按
 :class:`decimal.Decimal`（28 位有效数字）格式化为字符串返回。
 有限小数（分母仅含因子 2、5）给出精确值，无限小数按 28 位有效数字
 银行家舍入。
@@ -194,5 +203,96 @@ def compute_stoichiometry(
         "limiting_reactants": [block["normalized"] for block in reactant_blocks
                                if block["is_limiting"]],
         "reactants": reactant_blocks,
+        "products": product_blocks,
+    }
+
+
+def compute_reverse_plan(
+    reactants: Iterable[Species],
+    products: Iterable[Species],
+    coefficients: dict[str, int],
+    targets: Iterable[tuple[Species, Decimal]],
+) -> dict:
+    """反向投料规划：由生成物目标摩尔数反推最小反应进度与理论投料。
+
+    ``coefficients`` 以 :func:`app.cache.species_key` 为键；``targets`` 为
+    ``(目标产物物种, 非负目标摩尔数)`` 序列，目标物种必须都在生成物中，
+    且规范键唯一（去重由业务层负责）。
+
+    最小反应进度 ξ = max(目标量 ÷ 配平系数)——取最大值是为了让每个目标
+    产物的达成量（ξ·系数）都不低于其目标量；全部并列取得最大值的目标
+    产物恰好在达成量上无超额，其余目标产物存在正超额。
+
+    物种按规范键排序输出，因此同一反应调换书写顺序得到的结果完全一致。
+    """
+    reactants = sorted(reactants, key=lambda sp: sp.formula.key)
+    products = sorted(products, key=lambda sp: sp.formula.key)
+
+    target_fractions: dict[str, Fraction] = {
+        species_key(sp): decimal_to_fraction(amount) for sp, amount in targets
+    }
+    target_raw: dict[str, str] = {
+        species_key(sp): sp.raw for sp, _amount in targets
+    }
+
+    # 最小反应进度 ξ = max(目标量 / 系数)
+    ratios: dict[str, Fraction] = {
+        key: fraction / coefficients[key]
+        for key, fraction in target_fractions.items()
+    }
+    extent = max(ratios.values())
+    driving = {key for key, ratio in ratios.items() if ratio == extent}
+
+    reactant_blocks: list[dict] = []
+    for sp in reactants:
+        key = species_key(sp)
+        coef = coefficients[key]
+        required = extent * coef
+        reactant_blocks.append(
+            {
+                "input": sp.raw,
+                "normalized": sp.normalized,
+                "coefficient": coef,
+                "required": fraction_to_decimal_string(required),
+            }
+        )
+
+    product_blocks: list[dict] = []
+    target_blocks: list[dict] = []
+    for sp in products:
+        key = species_key(sp)
+        coef = coefficients[key]
+        achieved = extent * coef
+        block = {
+            "input": sp.raw,
+            "normalized": sp.normalized,
+            "coefficient": coef,
+            "achieved": fraction_to_decimal_string(achieved),
+        }
+        product_blocks.append(block)
+        if key in target_fractions:
+            target = target_fractions[key]
+            excess = achieved - target
+            target_blocks.append(
+                {
+                    "input": target_raw[key],
+                    "normalized": sp.normalized,
+                    "coefficient": coef,
+                    "target": fraction_to_decimal_string(target),
+                    "achieved": fraction_to_decimal_string(achieved),
+                    "excess": fraction_to_decimal_string(excess),
+                    "is_driving": key in driving,
+                }
+            )
+
+    return {
+        "reaction_extent": {
+            "value": fraction_to_decimal_string(extent),
+            "unit": "mol",
+        },
+        "driving_targets": [block["normalized"] for block in target_blocks
+                           if block["is_driving"]],
+        "reactants": reactant_blocks,
+        "targets": target_blocks,
         "products": product_blocks,
     }

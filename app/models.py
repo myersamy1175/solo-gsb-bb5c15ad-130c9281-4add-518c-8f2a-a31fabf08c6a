@@ -216,3 +216,75 @@ class StoichiometryResponse(BaseModel):
     )
     reactants: list[StoichReactantResult]
     products: list[StoichProductResult]
+
+
+# ------------------------------------------------------------ 反向投料规划
+class ReversePlanTarget(StoichAmount):
+    """反向规划的一条目标产物记录；复用非负十进制字符串摩尔数校验。"""
+
+    species: str = Field(
+        ...,
+        min_length=1,
+        description="目标生成物化学式；必须是规范化生成物之一（等价写法可识别），可只提交部分生成物",
+        examples=["H2O"],
+    )
+
+
+class ReversePlanRequest(ReactionRequest):
+    """``/stoichiometry/plan`` 请求：反应式 + 一个或多个生成物的目标摩尔数。"""
+
+    targets: list[ReversePlanTarget] = Field(
+        ...,
+        min_length=1,
+        description="目标生成物记录，至少一条；species 必须是规范化生成物"
+        "（无重复、未知物种），不必覆盖全部生成物",
+    )
+
+
+class PlanReactantResult(BaseModel):
+    input: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    coefficient: int = Field(description="最小互质正整数配平系数")
+    required: str = Field(
+        description="满足全部目标所需的理论投料量 = 反应进度 × 系数（mol）"
+    )
+
+
+class PlanTargetResult(BaseModel):
+    input: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    coefficient: int = Field(description="最小互质正整数配平系数")
+    target: str = Field(description="客户端请求的目标摩尔数（回显）")
+    achieved: str = Field(
+        description="按最小反应进度该产物的实际达成量 = 反应进度 × 系数（mol）"
+    )
+    excess: str = Field(description="超额量 = 达成量 − 目标量（mol），驱动产物为 0")
+    is_driving: bool = Field(
+        description="是否为决定最小反应进度的目标产物之一"
+        "（目标量 ÷ 系数取得最大值，可并列多个）"
+    )
+
+
+class PlanProductResult(BaseModel):
+    input: str
+    normalized: str
+    coefficient: int
+    achieved: str = Field(
+        description="按最小反应进度该生成物的实际达成量 = 反应进度 × 系数（mol）"
+    )
+
+
+class ReversePlanResponse(BaseModel):
+    reaction_id: str
+    cached: bool = Field(description="配平结果是否命中幂等缓存")
+    normalized: NormalizedReaction
+    reaction_extent: ReactionExtent
+    driving_targets: list[str] = Field(
+        description="全部并列决定最小反应进度的目标产物规范化化学式"
+        "（目标比恰好等于系数比时多于一个）"
+    )
+    reactants: list[PlanReactantResult] = Field(description="每种反应物的理论需求量")
+    targets: list[PlanTargetResult] = Field(
+        description="客户端提交的各目标产物：目标量、达成量与超额量"
+    )
+    products: list[PlanProductResult] = Field(description="全部生成物的达成量")
