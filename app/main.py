@@ -7,6 +7,8 @@
 * ``POST /analyze``          逐元素差异说明（配平前 + 配平后视图）；
 * ``POST /stoichiometry/batch`` 投料摩尔数 -> 反应进度、并列限量试剂、
   各反应物消耗/剩余与各生成物理论产量；
+* ``POST /stoichiometry/plan``  生成物目标摩尔数 -> 最小反应进度、
+  各反应物理论需求量、各产物达成量与超额量（反向投料规划）；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -22,6 +24,8 @@ from .models import (
     AnalyzeResponse,
     BalanceResponse,
     ReactionRequest,
+    ReversePlanRequest,
+    ReversePlanResponse,
     StoichiometryResponse,
     StoichiometryRequest,
     VariantRequest,
@@ -32,6 +36,7 @@ from .service import (
     get_reaction,
     process_analyze,
     process_balance,
+    process_reverse_plan,
     process_stoichiometry,
     process_variants,
 )
@@ -124,6 +129,26 @@ async def stoichiometry_batch(request: StoichiometryRequest):
         request.reactants,
         request.products,
         [item.model_dump() for item in request.amounts],
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/stoichiometry/plan",
+    response_model=ReversePlanResponse,
+    tags=["计量"],
+    summary="反向投料规划：生成物目标摩尔数 -> 最小反应进度与理论需求量",
+    responses={
+        400: {"description": "化学式解析失败"},
+        409: {"description": "同侧重复物种"},
+        422: {"description": "无法唯一配平 / 目标与生成物不对应 / 摩尔数非法"},
+    },
+)
+async def stoichiometry_plan(request: ReversePlanRequest):
+    status, payload = process_reverse_plan(
+        request.reactants,
+        request.products,
+        [item.model_dump() for item in request.targets],
     )
     return JSONResponse(status_code=status, content=payload)
 

@@ -1,6 +1,8 @@
 services:
   stoich:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: reaction-balancer:latest
     container_name: reaction-balancer
     ports:

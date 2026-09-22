@@ -17,7 +17,7 @@ from .balancer import (
 )
 from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
 from .parser import FormulaError, parse_formula
-from .stoichiometry import compute_stoichiometry, parse_moles
+from .stoichiometry import compute_reverse_plan, compute_stoichiometry, parse_moles
 
 
 # 错误码 -> HTTP 状态码
@@ -497,6 +497,109 @@ def process_stoichiometry(
         }
 
     result = compute_stoichiometry(reactants, products, coefficient_map, feed)
+    return 200, {
+        "reaction_id": reaction_id,
+        "cached": cached,
+        "normalized": balance_payload["normalized"],
+        **result,
+    }
+
+
+# ------------------------------------------------------------ 反向投料规划
+def process_reverse_plan(
+    reactant_texts: list[str],
+    product_texts: list[str],
+    target_items: list[dict[str, str]],
+) -> tuple[int, dict[str, Any]]:
+    """反向投料规划，返回 (http_status, payload)。
+
+    先复用 :func:`process_balance` 的唯一配平、规范化与幂等缓存逻辑；
+    配平失败（解析错误、重复物种、不可唯一配平等）沿用其结构化错误响应。
+    随后校验目标与规范化生成物一一可定位（允许只给部分生成物下目标，
+    但不能重复或出现未知物种），并以精确十进制计算满足全部目标所需的
+    最小反应进度、各反应物理论需求量、各产物达成量与超额量。
+    """
+    status, balance_payload = process_balance(reactant_texts, product_texts)
+    if status != 200:
+        return status, balance_payload
+
+    reaction_id = balance_payload["reaction_id"]
+    cached = balance_payload["cached"]
+
+    # 规范化物种（parse_side 已按规范键排序，与配平向量顺序一致）
+    reactants = list(parse_side(reactant_texts, "反应物"))
+    products = list(parse_side(product_texts, "生成物"))
+    coefficient_map = {
+        species_key(sp): coef
+        for sp, coef in zip(
+            (*reactants, *products), balance_payload["coefficients"]["vector"]
+        )
+    }
+    product_keys = {species_key(sp) for sp in products}
+
+    # ---- 目标条目：逐条解析物种与摩尔数，聚合所有可定位的问题
+    parsed_entries: list[tuple[str, Species]] = []
+    invalid_moles: list[dict[str, str]] = []
+    targets: dict[str, Decimal] = {}
+    duplicate: list[str] = []
+    seen_keys: set[str] = set()
+
+    for item in target_items:
+        species_text = item["species"]
+        moles_text = item["moles"]
+        try:
+            formula = parse_formula(species_text)
+        except FormulaError as exc:
+            # 目标物种本身无法解析：沿用化学式解析错误（400）
+            return STATUS_CODES["FORMULA_PARSE_ERROR"], {
+                "reaction_id": reaction_id,
+                "cached": cached,
+                "error": error_payload(
+                    "FORMULA_PARSE_ERROR",
+                    str(exc),
+                    {"field": "targets.species", "input": species_text},
+                ),
+            }
+        sp = Species(raw=species_text, normalized=formula.normalized, formula=formula)
+        key = species_key(sp)
+
+        if key in seen_keys:
+            duplicate.append(formula.normalized)
+        seen_keys.add(key)
+
+        try:
+            amount = parse_moles(moles_text)
+        except (ValueError, InvalidOperation):
+            invalid_moles.append({"species": formula.normalized, "moles": moles_text})
+        else:
+            parsed_entries.append((moles_text, sp))
+            targets.setdefault(key, amount)
+
+    unknown = sorted(
+        {sp.normalized for _, sp in parsed_entries
+         if species_key(sp) not in product_keys}
+    )
+
+    if duplicate or unknown or invalid_moles:
+        details: dict[str, Any] = {}
+        if duplicate:
+            details["duplicate"] = sorted(set(duplicate))
+        if unknown:
+            details["unknown"] = unknown
+        if invalid_moles:
+            details["invalid_moles"] = invalid_moles
+        return STATUS_CODES["INVALID_REQUEST"], {
+            "reaction_id": reaction_id,
+            "cached": cached,
+            "error": error_payload(
+                "INVALID_REQUEST",
+                "目标记录必须对应规范化生成物：不能重复或出现未知物种，"
+                "且每条摩尔数必须是非负十进制字符串（不能为 JSON 数字）",
+                details,
+            ),
+        }
+
+    result = compute_reverse_plan(reactants, products, coefficient_map, targets)
     return 200, {
         "reaction_id": reaction_id,
         "cached": cached,

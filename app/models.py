@@ -216,3 +216,77 @@ class StoichiometryResponse(BaseModel):
     )
     reactants: list[StoichReactantResult]
     products: list[StoichProductResult]
+
+
+# ------------------------------------------------------------ 反向投料规划
+class PlanTarget(BaseModel):
+    species: str = Field(
+        ...,
+        min_length=1,
+        description="目标生成物化学式；必须对应规范化后的生成物之一（等价写法可识别）",
+        examples=["H2O"],
+    )
+    moles: str = Field(
+        ...,
+        min_length=1,
+        description="目标摩尔数的非负十进制字符串（如 \"3.0\"、\"0\"、\"1e-3\"），"
+        "不要传 JSON 数字以避免浮点误差",
+        examples=["2.0"],
+    )
+
+    @field_validator("species", "moles")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class ReversePlanRequest(ReactionRequest):
+    """``/stoichiometry/plan`` 请求：反应式 + 一个或多个生成物的目标摩尔数。"""
+
+    targets: list[PlanTarget] = Field(
+        ...,
+        min_length=1,
+        description="目标产物记录；每条 species 必须对应一个规范化生成物"
+        "（无重复、未知物种），允许只给部分生成物下目标",
+    )
+
+
+class PlanReactantResult(BaseModel):
+    input: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    coefficient: int = Field(description="最小互质正整数配平系数")
+    required: str = Field(description="满足全部目标的理论需求量（mol）= ξ·系数")
+
+
+class PlanProductResult(BaseModel):
+    input: str
+    normalized: str
+    coefficient: int
+    achieved: str = Field(description="该反应进度下的实际达成量（mol）= ξ·系数")
+    target: str | None = Field(
+        description="客户端提交的目标摩尔数回显；未列入 targets 的产物为 null"
+    )
+    excess: str | None = Field(
+        description="超额量 = 达成量 − 目标量（mol），恒非负；未列入 targets 的产物为 null"
+    )
+    is_driving: bool = Field(
+        description="是否为取得最大 目标量÷系数 的并列驱动目标产物之一"
+    )
+
+
+class ReversePlanResponse(BaseModel):
+    reaction_id: str
+    cached: bool = Field(description="配平结果是否命中幂等缓存")
+    normalized: NormalizedReaction
+    reaction_extent: ReactionExtent
+    driving_targets: list[str] = Field(
+        description="全部并列驱动目标产物的规范化化学式"
+        "（多个目标的 目标量÷系数 恰好相等时多于一个）"
+    )
+    reactants: list[PlanReactantResult]
+    products: list[PlanProductResult]

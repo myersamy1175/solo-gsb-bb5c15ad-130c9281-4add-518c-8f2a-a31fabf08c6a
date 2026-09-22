@@ -1,15 +1,26 @@
-"""限量试剂与反应进度的精确计量计算。
+"""限量试剂、反应进度与反向投料规划的精确计量计算。
 
-给定唯一配平后的反应（最小互质正整数系数）与每种反应物的投料摩尔数
-（:class:`decimal.Decimal`），计算：
+给定唯一配平后的反应（最小互质正整数系数），提供两个方向的计算：
+
+正向（投料 -> 产量，:func:`compute_stoichiometry`）——给定每种反应物的
+投料摩尔数（:class:`decimal.Decimal`），计算：
 
 * 反应进度 ξ = min(投料量 ÷ 配平系数)，系数为正整数，结果为非负小数；
 * 所有并列取得最小值的限量试剂（可多于一种，如投料恰好按计量比）；
 * 每种反应物的消耗量（ξ·系数）与剩余量（投料量 − 消耗量）；
 * 每种生成物的理论产量（ξ·系数）。
 
+反向（目标产量 -> 投料，:func:`compute_reverse_plan`）——给定一个或多个
+生成物的目标摩尔数，计算：
+
+* 满足全部目标所需的最小反应进度 ξ = max(目标量 ÷ 配平系数)；
+* 所有并列取得最大值的驱动目标产物；
+* 每种反应物的理论需求量（ξ·系数）；
+* 每种生成物的达成量（ξ·系数）；对显式给出目标的产物再给出目标量
+  与超额量（达成量 − 目标量，恒非负）。
+
 为避免浮点误差，输入十进制先无损转成 :class:`fractions.Fraction`，
-比较与最小值判定全部使用精确有理数；最终结果再按
+比较与最小值/最大值判定全部使用精确有理数；最终结果再按
 :class:`decimal.Decimal`（28 位有效数字）格式化为字符串返回。
 有限小数（分母仅含因子 2、5）给出精确值，无限小数按 28 位有效数字
 银行家舍入。
@@ -193,6 +204,83 @@ def compute_stoichiometry(
         },
         "limiting_reactants": [block["normalized"] for block in reactant_blocks
                                if block["is_limiting"]],
+        "reactants": reactant_blocks,
+        "products": product_blocks,
+    }
+
+
+def compute_reverse_plan(
+    reactants: Iterable[Species],
+    products: Iterable[Species],
+    coefficients: dict[str, int],
+    targets: dict[str, Decimal],
+) -> dict:
+    """反向投料规划：目标产量 -> 最小反应进度、理论需求量与超额量。
+
+    ``coefficients`` 与 ``targets`` 均以 :func:`app.cache.species_key` 为键；
+    ``targets`` 只覆盖部分生成物（至少一个），值非负。
+
+    最小反应进度 ξ = max(目标量 ÷ 配平系数)，取得最大值的目标产物为
+    “驱动目标”（可并列多个）。每种反应物给出理论需求量 ξ·系数；每种
+    生成物给出达成量 ξ·系数；显式给出目标的产物额外回显目标量与
+    超额量（达成量 − 目标量，恒非负）。
+
+    物种按规范键排序输出，因此同一反应调换书写顺序得到的结果完全一致。
+    """
+    reactants = sorted(reactants, key=lambda sp: sp.formula.key)
+    products = sorted(products, key=lambda sp: sp.formula.key)
+
+    target_fractions = {key: decimal_to_fraction(amount)
+                        for key, amount in targets.items()}
+
+    # 最小反应进度 ξ = max(目标量 / 系数)
+    ratios: dict[str, Fraction] = {
+        key: target_fractions[key] / coefficients[key] for key in target_fractions
+    }
+    extent = max(ratios.values())
+    driving = {key for key, ratio in ratios.items() if ratio == extent}
+
+    reactant_blocks: list[dict] = []
+    for sp in reactants:
+        key = species_key(sp)
+        coef = coefficients[key]
+        reactant_blocks.append(
+            {
+                "input": sp.raw,
+                "normalized": sp.normalized,
+                "coefficient": coef,
+                "required": fraction_to_decimal_string(extent * coef),
+            }
+        )
+
+    product_blocks: list[dict] = []
+    for sp in products:
+        key = species_key(sp)
+        coef = coefficients[key]
+        achieved = extent * coef
+        block = {
+            "input": sp.raw,
+            "normalized": sp.normalized,
+            "coefficient": coef,
+            "achieved": fraction_to_decimal_string(achieved),
+            "is_driving": key in driving,
+            "target": None,
+            "excess": None,
+        }
+        if key in target_fractions:
+            block["target"] = fraction_to_decimal_string(target_fractions[key])
+            block["excess"] = fraction_to_decimal_string(
+                achieved - target_fractions[key]
+            )
+        product_blocks.append(block)
+
+    return {
+        "reaction_extent": {
+            "value": fraction_to_decimal_string(extent),
+            "unit": "mol",
+        },
+        "driving_targets": [block["normalized"] for block in product_blocks
+                            if block["is_driving"]],
         "reactants": reactant_blocks,
         "products": product_blocks,
     }
